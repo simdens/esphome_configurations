@@ -1,0 +1,175 @@
+substitutions:
+  kWh_per_pulse: "0.006666667"  # 150 pulses/kWh --> 1/150 kWh/pulse
+
+esphome:
+  name: stromzahler-heizung
+  friendly_name: Stromzähler Heizung
+  on_boot: 
+    then:
+      - lambda: |-
+          id(energymeter).publish_state( id(total_pulses) );
+
+esp8266:
+  board: d1_mini
+  restore_from_flash: True
+
+# Enable logging
+logger: 
+  level: WARN
+
+preferences:
+  flash_write_interval: 1s   # only do this if the values does not change very often otherwise flash could wear out..
+
+globals:
+  # Energy Meter Pulse Counter
+  - type: uint64
+    id: total_pulses
+    restore_value: yes
+  # Time instance of last pulse (to better estimate the power during falling power consumption)
+  - type: uint64
+    id: millis_last_pulse
+    restore_value: no
+    initial_value: '0'
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_key
+  actions:
+    - action: energymeter_set_value
+      variables:
+        energymeter_kWh: float
+      then:
+        - lambda: |-
+            id(energymeter).publish_state( energymeter_kWh / ${kWh_per_pulse} );
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Stromzahler-Heizung"
+    password: !secret wifi_ap_password
+
+captive_portal:
+    
+interval:
+  # Estimate power even if the power consumption drops suddenly. 
+  # If a new pulse takes longer than the previous pulse period, update the power with 
+  # a new lower power estimation.
+  # The Powermeter is splitted into two sensors, one "powermeter" sensor (which is 
+  # exposed to home assistant) and one "powermeter_pulses" sensor. The "povermeter_pulses"
+  # sensor is only used to filter the measured pulses with a "throttle_average" filter.
+  # Since this intervall updates the power directly in "powermeter", the intervall updates
+  # do not influence the "throttle_average" filter.
+  - interval: 10s
+    then:
+        - lambda: |-
+            if ( !isnan(id(millis_last_pulse)) && !isnan(id(powermeter).raw_state) ) {
+              
+              ESP_LOGD("intervall","Timestamp %d",millis());
+
+              uint64 oldTime = id(millis_last_pulse);
+              uint64 time = millis();
+              uint64 period = ( 60000.0 / (float) id(powermeter).raw_state );
+
+              if ( (time - oldTime) > period ) {
+                id(powermeter).publish_state(  60.0 * 1000.0 / (time - oldTime) );
+              }
+            }
+
+binary_sensor:
+  # Internal
+  # - Schmitt Trigger for analog input signal
+  # - Measuring and storing the time stamp between two pulse signals
+  - platform: analog_threshold
+    name: "Pulse"
+    id: plusesignal
+    internal: True
+    sensor_id: adcinput
+    threshold:       
+      upper: 0.155
+      lower: 0.140
+    on_press: 
+      then:
+        - lambda: |-
+              static uint64 oldTime = 0;
+              uint64 time = millis();
+              if ( oldTime != 0) {
+                id(powermeter_pulses).publish_state( 60.0 * 1000.0 / (time - oldTime) );
+              }
+              if ( !isnan(id(energymeter).raw_state) ) {
+                id(energymeter).publish_state( id(energymeter).raw_state + 1 );
+              } else {
+                id(energymeter).publish_state( 1 );
+              }              
+              id(millis_last_pulse) = time;
+              oldTime = time;
+
+sensor:  
+  # Internal
+  # ADC input is used to properly debounce the signal
+  - platform: adc
+    pin: A0
+    id: adcinput
+    name: "Analog Voltage Signal"
+    internal: True            # Signal is internal only
+    samples: 50               # Do a burst of 50 ADC samples and take average
+    update_interval: 0.010s   # Do this every 10ms (at least with debugging console connected, lowest possible will bey will be 13ms in reality)
+    filters:
+      - multiply: 3.3  # 3.3V Ref
+      - lambda: |-
+          ESP_LOGD("adc","Timestamp %d",millis());
+          return x;
+
+  # Internal
+  # Raw State: Pulses/min
+  # State: Pulses/min
+  # Filter:
+  #  - throttle and take average over 10s to minimize the error due to the (relatively low) ADC sample frequency of 10ms. But this is the fastest possible frequency.
+  - platform: template
+    id: powermeter_pulses
+    internal: True
+    filters: 
+      - throttle_average: 10s
+
+  # Home Assistant
+  # State: W
+  # Raw State: Pulses/min
+  - platform: copy
+    source_id: powermeter_pulses
+    id: powermeter
+    unit_of_measurement: 'W'
+    name: 'Active Power'
+    device_class: 'power'
+    icon: 'mdi:flash'
+    accuracy_decimals: 0
+    filters:
+      - multiply: ${kWh_per_pulse}  # kWh/min
+      - multiply: 60                # kWh/min --> kWh/h = kW
+      - multiply: 1000              # kW --> W
+   
+  # Home Assistant       
+  # State: kWh
+  # Raw State: Pulses
+  - platform: template
+    id: energymeter
+    unit_of_measurement: 'kWh'
+    name: 'Active Energy'
+    device_class: 'energy'
+    state_class: 'total_increasing'
+    icon: 'mdi:lightning-bolt'
+    accuracy_decimals: 2
+    filters:
+      - multiply: ${kWh_per_pulse}
+      - lambda: |-
+          id(total_pulses) = id(energymeter).raw_state;
+          return x;
+
+
+    
