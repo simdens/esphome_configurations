@@ -18,6 +18,7 @@ Issues with known solutions:
 
 ### Feautures of this implementation
 
+  * **Reliable Measurement**
   * energy meter value survives reboot
   * `stromzahler_heizung_energymeter_set_value`-Action to set energy meter value from inside Home Assistant
   * Debouncing of input signal (Schmitt Trigger on analog value)
